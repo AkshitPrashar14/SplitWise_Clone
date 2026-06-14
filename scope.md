@@ -1,43 +1,35 @@
-# Project Scope: Splitwise Clone
+# Project Scope, Database Schema, and Anomaly Log
 
-## 1. Objective
-To build a fully functional, production-ready full-stack web application that allows users to seamlessly track shared expenses, manage groups, and calculate simplified debts among friends, flatmates, or travel companions.
+## 1. Database Schema
+The database is built using PostgreSQL (Supabase) and managed via Prisma ORM. The schema is designed to robustly handle complex, multi-user shared expenses.
 
-## 2. Core Features (In-Scope)
+### Core Entities:
+- **User:** Stores authentication details and profile information (`id`, `name`, `email`, `passwordHash`).
+- **Group:** Represents a collection of users sharing expenses (`id`, `name`, `currency`).
+- **GroupMember:** A many-to-many join table tracking which Users belong to which Groups (`id`, `groupId`, `userId`).
+- **Expense:** Represents a single transaction paid by a user (`id`, `groupId`, `paidById`, `amount`, `currency`, `splitType`). Note: `amount` is stored as an integer (cents/paise) to prevent floating-point errors.
+- **ExpenseSplit:** Represents how much of the total expense is owed by individual users (`id`, `expenseId`, `userId`, `amount`).
+- **Settlement:** Records real-world payments made between users to clear debts (`id`, `groupId`, `paidById`, `paidToId`, `amount`).
 
-### User Authentication & Management
-- Secure user registration and login using NextAuth.js (Credentials Provider).
-- Password hashing using bcrypt for security.
-- **"Ghost User" capability**: Users can dynamically type the names of friends who do not yet have accounts while creating an expense. The system will automatically generate tracking profiles for them and calculate their debts seamlessly.
+---
 
-### Group Management
-- Creation of dynamic groups (e.g., "Goa Trip", "Apartment 4B").
-- Ability to invite or add multiple participants to a group.
-- Centralized group dashboard to view total group spending and individual net balances.
+## 2. Anomaly Log (Data Problems & Resolutions)
+*Note: Because this application dynamically generates and processes its own real-time data instead of relying on a static CSV file import, this anomaly log details the severe data integrity problems, edge cases, and algorithmic anomalies encountered and resolved during the system's development.*
 
-### Expense Tracking & Splitting Engine
-- Ability to add detailed expenses with descriptions and currency selection (e.g., INR, USD).
-- Support for complex, real-world splitting logic:
-  - **Equal Split:** Divide the total bill evenly among selected participants.
-  - **Exact Split:** Specify the exact monetary amount each participant owes.
-  - **Percentage Split:** Split the bill by specific percentage allocations.
-  - **Share/Ratio Split:** Divide by unit shares (e.g., Person A pays 2 shares, Person B pays 1 share).
-- Precision math handling to ensure no floating-point rounding errors (1-cent remainders are dynamically distributed).
+### Anomaly 1: Unregistered User Data (The "Ghost User" Problem)
+- **Problem:** When adding an expense, users frequently need to split costs with people who do not yet have an account in the system (e.g., typing a friend's name manually). A standard foreign-key database schema would throw a severe relational constraint error because the `userId` in the `ExpenseSplit` table would not map to an existing `User`.
+- **Handling Strategy:** Implemented a dynamic "Ghost Account" generation system. When the API detects an unregistered name in an expense payload, it intercepts the request, seamlessly generates a hidden User account using a dummy email (`[name]_[timestamp]@splitwise.local`), binds them to the Group, and links their newly generated `userId` to the expense split. This prevents relational data anomalies while allowing a frictionless user experience.
 
-### Advanced Debt Simplification
-- An underlying algorithmic engine (`src/lib/balances.ts`) that automatically analyzes complex, overlapping group debts and condenses them into the minimum possible number of transactions (e.g., if A owes B $10, and B owes C $10, it simplifies to A owes C $10).
+### Anomaly 2: Floating-Point Division Inaccuracies (The 1-Cent Deficit)
+- **Problem:** A fundamental computer science data anomaly occurs when splitting currencies. For example, splitting a ₹100.00 expense equally among 3 users results in ₹33.3333... per person. If truncated to ₹33.33, the sum of the splits (33.33 + 33.33 + 33.33 = ₹99.99) creates a permanent 1-cent deficit in the system, mathematically corrupting the database over time.
+- **Handling Strategy:** 
+  1. Converted the entire database schema to store all financial data as exact integers (cents/paise) rather than floats.
+  2. Implemented an algorithmic check during the `POST /api/groups/[id]/expenses` route. It calculates the sum of all individual splits and compares it to the absolute total expense. If there is a remainder (e.g., 1 cent), the system programmatically assigns the deficit to the first user in the array, ensuring the database equation perfectly balances to 0.
 
-### Settlement System
-- Users can record payments ("Settle Up") to clear outstanding balances with specific group members.
-- Instant reflection of settled debts on the group dashboard.
+### Anomaly 3: Graph Circularity (Redundant Debt Loops)
+- **Problem:** In active groups, debt graphs quickly become circularly anomalous (e.g., User A owes User B ₹50, User B owes User C ₹50, and User C owes User A ₹50). Tracking these raw transactions directly in the UI creates an unreadable web of infinite micro-debts.
+- **Handling Strategy:** Built a complex Graph Reduction Algorithm (`simplifyDebts` in `src/lib/balances.ts`). Instead of processing raw debts line-by-line, the system extracts the absolute net balance (total paid minus total owed) for every user, discards the raw relationship graph, and calculates the mathematical minimum number of transactions required to bring every net balance back to zero.
 
-### User Interface & Experience
-- Responsive, modern "Glassmorphism" inspired design.
-- Fluid, app-like modal interactions and transitions powered by Framer Motion.
-- Robust, zero-reload theming engine with four switchable aesthetic themes (Light, Dark, Sunset, Oceanic) driven by CSS variables.
-
-## 3. Out of Scope (Future Enhancements)
-- Third-party OAuth integration (Google/GitHub login).
-- Real-time websocket push notifications for new expenses.
-- Native mobile applications (iOS/Android) via React Native.
-- Direct integration with banking APIs for actual fund transfers (e.g., Stripe, Plaid).
+### Anomaly 4: "Me" Duplication Error (Session Context Loss)
+- **Problem:** When the session user submitted an expense without explicitly defining their underlying `userId` in the payload (defaulting only to the string name "Me" or their first name), the backend `findFirst` lookup would occasionally fail to map them to their authenticated session ID. This generated a duplicate user data entry in the database where a user appeared to owe money to a separate ghost instance of themselves.
+- **Handling Strategy:** Explicitly bound the NextAuth session `user.id` to the frontend state initialization, overriding the name-based lookup for the active user. This strictly enforces data parity between the frontend session cookie and the backend relational lookup.
